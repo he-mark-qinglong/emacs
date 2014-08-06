@@ -1,0 +1,235 @@
+;; 用clang实现符号跳转功能
+;; Copyright (C) 2013 赵纯华
+
+;; Author: 赵纯华 <ynsjzch@163.com>
+;; Keywords: jump
+;; Version: 0.1
+
+(provide 'symbol-jump-clang)
+
+(defcustom sj-clang-executable
+  (executable-find "clang")
+  "*Location of clang executable"
+  :type 'file)
+
+(defconst sj-clang-error-buffer-name "*clang error*")
+
+(defun sj-clang-handle-error (res args)
+  (let ((cmd (concat sj-clang-executable " " (mapconcat 'identity args " "))))    
+    (message "clang failed with error %d:\n" cmd)))
+
+(defcustom sj-clang-flags nil
+  "Extra flags to pass to the Clang executable.
+This variable will typically contain include paths, e.g., ( \"-I~/MyProject\", \"-I.\" )."
+  :type '(repeat (string :tag "Argument" "")))
+
+(defun sj-clang-is-buildin-type(type)
+  (or (string= type "long")
+      (string= type "short")
+      (string= type "unsigned")
+      (string= type "char")
+      (string= type "wchar_t")
+      (string= type "char32_t")
+      (string= type "char16_t")
+      (string= type "int")))
+
+(defun sj-clang-get-current-type()
+  "获得当前行标识符的类型，
+如果是类型定义，返回type-decl;
+如果是类型使用，返回type;
+如果是变量定义，返回variant-decl;
+如果是变量使用，返回variant;
+"
+  (let ((reg)(ret)
+        (next-symbol)
+        (next-type)
+        (prev-symbol)
+        (prev-type)
+        (old-pos (point)))
+    ;;获得下一行的符号
+    (setq reg (format "^\\([a-z_]*\\) '\\(.*\\)'" sym line col))
+    (setq ret (search-forward-regexp reg nil t))
+    (if ret
+        (progn
+          (setq next-symbol (match-string 2))
+          (setq next-type (match-string 1))
+          (message "next:%s,%s" next-type next-symbol)
+          
+          ;;获得上一行的符号
+          (previous-line)
+          (previous-line)
+          (previous-line)
+          (setq ret (search-forward-regexp reg nil t))
+          (goto-char old-pos)
+          (if ret
+              (progn
+                (setq prev-symbol (match-string 2))
+                (setq prev-type (match-string 1))
+                (message "prev:%s,%s" prev-type prev-symbol)
+                (cond
+                 ((string= next-type "identifier") (setq ret "type"))
+                 
+                 ((or (string= next-type "l_brace")
+                      (string= next-type "colon"))
+                  (if (or (string= prev-type "struct")
+                          (string= prev-type "class")
+                          (string= prev-type "union"))
+                      (setq ret "type-decl")))
+                 
+                 ((or (string= prev-type "identifier")
+                      (sj-clang-is-buildin-type prev-type))
+                  (setq ret "variant-decl"))
+                 
+                 (t (setq ret "variant")))
+                )))
+      (message "search next faild"))
+    ))
+
+(setq sj-clang-current-file nil)
+(defun sj-clang-jump (file line col)
+  "跳转到目标,并且切换到文件"
+  (let ((buffer))
+    (if (string= file "<stdin>") (setq file sj-clang-current-file))
+    (message "result:%s,%s,%s" file line col)
+    (setq buffer (find-file file))
+    (goto-line (string-to-number line) buffer)
+    (line-move-to-column (string-to-number col))
+    ))
+
+(defun sj-clang-find-decl(sym decl)
+  "查找类型定义，sym指定了类名。如果找到了类型定义，就返回(file line col)三元组；否则返回nil"
+    (let ((ret)(pos)
+          (type)(file)(line)(col)
+          (old-pos (point))
+          (reg))
+      (goto-char (point-min))
+      (setq reg (format "^identifier '%s'.*Loc=<\\(.*\\):\\([0-9]*\\):\\([0-9]*\\)>" sym))
+      (setq pos (search-forward-regexp reg nil t))
+      ;;循环的进行查找，直到找到的sym的类型是type-decl为止
+      (while pos
+        (setq file (match-string 1))
+        (setq line (match-string 2))
+        (setq col (match-string 3))
+        (setq type (sj-clang-get-current-type))
+        (if (string= type decl)
+            (progn
+              (setq ret (list file line col))
+              (setq old-pos nil)
+              (setq pos nil))
+          (setq pos (search-forward-regexp reg nil t)))
+        )
+      (if old-pos  (goto-char old-pos))
+      (setq ret ret)
+  ))
+
+(defun sj-clang-parse-output (sym line col)
+  "解释clang命令的执行结果，把sym的类型定义或者变量定义找出来，然后跳转到目标"
+  (let ((ret)
+        (type)
+        (reg))
+    (setq col (+ col 1)) ;;clang的列是以1为基索引的
+    (goto-char (point-min))
+    
+    (setq reg (format "^identifier '%s'\\(.*\\)Loc=<<stdin>:%i:%i>" sym line col))
+    (setq ret (search-forward-regexp reg nil t))
+    (message "%s,%s,%s,%s" sym line col (point))
+    
+    (if ret
+        (progn
+          (message "%s,%s,%s,%s,%s,%s" sym line col ret (match-string 1) (point))
+          (setq type (sj-clang-get-current-type))
+          (message "type:%s" type)
+          (cond
+           
+           ((string= type "type")
+            (setq ret (sj-clang-find-decl sym "type-decl"))
+            (if ret (apply 'sj-clang-jump ret)))
+
+           ((string= type "variant")
+            (setq ret (sj-clang-find-decl sym "variant-decl"))
+            (if ret (apply 'sj-clang-jump ret)))
+           
+           (t (message "unknown type")
+              (setq ret nil)))
+          (message type)))
+    (if (not ret) (message "search %s faild" sym))
+    ))
+
+
+(defsubst sj-clang-lang-option ()
+  (cond ((eq major-mode 'c++-mode)
+         "c++")
+        ((eq major-mode 'c-mode)
+         "c")
+        ((eq major-mode 'objc-mode)
+         (cond ((string= "m" (file-name-extension (buffer-file-name)))
+                "objective-c")
+               (t
+                "objective-c++")))
+        (t
+         "c++")))
+
+(defsubst sj-clang-build-symbol-args()
+  (append '("-cc1" "-fsyntax-only")
+          (list "-x" (sj-clang-lang-option))
+          sj-clang-flags
+          ;;'("-ast-dump")
+          '("-dump-tokens")
+          (list "-")))
+
+
+(defun sj-clang-call-process (symbol &rest args)
+  (let ((buf (get-buffer-create "*cuc-output*"))
+        res)
+    (setq sj-clang-current-file (buffer-file-name))
+    (with-current-buffer buf (erase-buffer))
+    (setq res (apply 'call-process-region (point-min) (point-max)
+                     sj-clang-executable nil buf nil args))
+    (with-current-buffer buf
+      (unless (eq 0 res)
+        (sj-clang-handle-error res args))
+      ;; Still try to get any useful input.
+      (apply 'sj-clang-parse-output symbol))))
+
+
+(defun sj-get-token-at-cursor(&optional forward)
+  "获得光标所在处的一个token,不断的调用可以起到词法分析的效果
+param forward
+如果是1，那么在获取token的同时还要调用c-forward-token-2移动到下一个token;
+如果是-1,那么在获取token的同时还要调用c-backward-token-2移动到上一个token;
+否则不移动光标.
+这个函数是sbw的底层核心函数之一，它是进行代码分析的利器.
+"
+  (let ((old-pos (point))
+        (ret) (begin) (end) (col) (line))
+    (c-beginning-of-current-token)
+    (setq begin (point))
+    (goto-char (+ (point) 1))
+    (c-end-of-current-token)
+    (setq end (point))
+    (goto-char old-pos)
+    ;;(message "%s,%s" begin end)
+    (if forward
+        (if (= forward 1)
+            (c-forward-token-2)
+          (if (= forward -1)
+              (c-backward-token-2))))
+    (setq line (line-number-at-pos begin))
+    (setq col (- begin (line-beginning-position)))
+    (setq ret (list (buffer-substring-no-properties begin end) line col))
+))
+
+(defun sj-clang-goto-on-cursor()
+  "跳到光标所在处的符号的定义"
+  (interactive)
+  (let ((pos (point)))
+    (apply 'sj-clang-call-process (sj-get-token-at-cursor) (sj-clang-build-symbol-args))
+    ))
+
+(defun sj-clang-type-goto-on-cursor()
+  "跳到光标所在处的符号的类型"
+  (interactive)
+  (let ((pos (point)))
+    (sj-get-token-at-cursor)
+    (apply 'sj-clang-call-process 0 (sj-clang-build-symbol-args))
+    ))

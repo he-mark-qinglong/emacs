@@ -1,0 +1,647 @@
+(require 'cuc-base)
+
+(defcustom cucc-global-call-count 50
+  "触发global的cuc调用的按键次数，当用于的按键次数达到了这个数值，就触发一次global的cuc进程调用")
+
+(defface cucc-overlay-face
+  '((((class color) (min-colors 88) (background dark))
+    :weight bold :background "#223388"))
+  "用于 *cuc-message* 和 *cuc-completion* 中的光标条."
+  :group 'cucc-items-mode)
+
+
+(defvar cucc-item-line 1
+  "记录当前选中的自动提示项目的行号，可以和 cucc-current-items 变量结合
+来获取当前选中的项目对象")
+
+(defvar cucc-item-overlay nil
+  "记录当前在 *cuc-completion* z中的光标对象")
+
+(defun cucc-item-make-overlay ()
+  "创建在 *cuc-completion* 里面的光标"
+  (let ((line-begin)(face)(width)
+        (ov))
+    (with-current-buffer (get-buffer-create "*cuc-completion*")
+      (setq face 'cucc-overlay-face)
+      (goto-char (point-min))
+      (setq line-begin (line-beginning-position cucc-item-line))
+      (setq width (window-width (get-buffer-window)))
+      (setq ov (make-overlay line-begin (+ line-begin width )))
+      (overlay-put ov 'face face)
+      (if cucc-item-overlay
+          (delete-overlay cucc-item-overlay))
+      (setq cucc-item-overlay ov))
+    ))
+
+(defun cucc-current-item()
+  "获取当前选中项目,根据 cucc-item-line 进行获取"
+  (let ((ret nil))
+    (if cucc-current-items
+        (nth (- cucc-item-line 1) cucc-current-items)
+      (setq ret nil))
+    ))
+
+(defun cucc-current-overload()
+  "获取当前选中的重载函数,根据 cucc-overload-line 进行获取,如果当前项目不是一个函数，则返回nil"
+  (let ((ret nil)(item)(overloads))
+    (setq item (nth (- cucc-item-line 1) cucc-current-items))
+    (setq overloads (cdr (assoc "overloads" item)))
+    (if overloads (setq ret (nth (- cucc-overload-line 1) overloads)))
+    (setq ret ret)
+  ))
+
+
+(defun cucc-select-item()
+  "选择 cucc-item-line 行号指定的提示项目"
+  (let ((item))
+    (if cucc-current-items
+        (progn
+          (cucc-item-make-overlay)
+          (cucc-update-current-item))      
+      (with-current-buffer (get-buffer-create "*cuc-message*")
+        (erase-buffer)))
+  ))
+
+
+(defvar cucc-overload-line 1
+  "记录当前选中的重载函数的行号，可以和当前选中的自动提示项中的重载函数列表结合来获取当前的
+重载函数对象")
+
+(defvar cucc-overload-overlay nil
+  "记录当前在 *cuc-message* 中的光标对象")
+
+(defun cucc-overload-make-overlay ()
+  "创建在 *cuc-message* 里面的光标"
+  (let ((line-begin)(face)(width)
+        (ov))
+    (with-current-buffer (get-buffer-create "*cuc-message*")
+      (setq face 'cucc-overlay-face)
+      (goto-char (point-min))
+      (setq line-begin (line-beginning-position cucc-overload-line))
+      (setq width (window-width (get-buffer-window)))
+      (setq ov (make-overlay line-begin (+ line-begin width )))
+      (overlay-put ov 'face face)
+      (if cucc-overload-overlay
+          (delete-overlay cucc-overload-overlay))
+      (setq cucc-overload-overlay ov))
+    ))
+
+(defun cucc-select-oveload()
+  "选择 cucc-overload-line 行号指定的重载函数"
+  (let ((overload (cucc-current-overload))
+        (comment)
+        (overloads)
+        (item (cucc-current-item)))
+    (if overload
+        (progn
+          (cucc-overload-make-overlay)
+          (setq comment (cdr (assoc "comment" overload)))
+          (setq overloads (cdr (assoc "overloads" item)))
+          (cucc-update-overload-comment overloads comment)
+          ))
+  ))
+
+
+(defun cucc-update-overload-comment(overloads comment)
+  (if (not comment) (setq comment ""))
+  (with-current-buffer (get-buffer-create "*cuc-message*")
+    (move-end-of-line (list-length overloads))
+    (message "%s" (point))
+    (delete-region (point) (point-max))    
+    (insert "\n" comment))
+  )
+
+
+(defconst cucc-buffer "*cuc-completion*")
+
+
+(defvar cuc-completion-list nil
+  "记录由cuc库返回给emacs的一次匹配的所有结果,它由*cuc-output* buffer 里的代码执行建立")
+(defvar cuc-is-global-completion nil
+  "来自于*cuc-output*，标记cuc进程送过来的是否是一次全局匹配")
+
+(defvar cucc-list nil
+  "记录当前正在使用的自动完成列表,它可能是 cuc-completion-list 或者是与文件关联的全局定义表
+global-list")
+
+(defvar cucc-current-items
+  nil
+  "记录在 *cuc-completion* 中过滤后的items，它是 cucc-list 的子集")
+
+
+(defun cucc-update-current-item()
+  "更新 *cuc-completion* 中当前选中的匹配项目，并且把选中项目的相信信息显示在
+*cuc-message* 中，如果项目有注释，那么 *cuc-message* 中会显示注释，如果是函数，会显示
+所有的函数重载版本，并且会显示选中的一个重载函数的注释，如果它有注释的话。"
+  (let ((overload)
+        (item (cucc-current-item))
+        (overload)(type)
+        (commont)
+        (overloads))
+    (setq  overloads (cdr (assoc "overloads" item)))
+    (setq commont (cdr (assoc "comment" item)))
+    (with-current-buffer (get-buffer-create "*cuc-message*")
+      (erase-buffer)
+      (if overloads
+          (while overloads
+            (setq overload (car overloads))
+            (setq type (cdr (assoc "type" overload)))
+            (if type (insert type " "))
+            ;;插入很多空格，这样使得光标占满整个窗口宽度
+            (insert (cdr (assoc "name" overload)) ";                                                                                     \n")
+            (setq overloads (cdr overloads)))
+        (progn
+          (setq type (cdr (assoc "type" item)))
+          (if type (insert type " "))
+          (insert (cdr (assoc "name" item)) ";\n")))
+
+      ;;如果是函数，显示选中的那个重载版本的注释
+      (setq cucc-overload-line 1)
+      (setq overload (cucc-current-overload))
+      (if overload
+          (setq commont (cdr (assoc "comment" overload))))
+      (if commont (insert commont))
+      (if overload
+          (cucc-overload-make-overlay)))
+    ))
+
+
+(defun cucc-filter-items()
+  "根据用户当前的输入过滤提示项目，过滤的结果存储在 cucc-current-items 里面"
+  (let ((items cucc-list)(item))
+    (if (or (string= cucc-substring "") (not cucc-substring))
+        (setq cucc-current-items cucc-list)
+      ;;这一句用cucc-is-completion-item函数过滤掉不匹配的项目,它的意思是:
+      ;;mapcar把cucc-list列表里的每个item经过lambda表达式，得到一个新的列表
+      ;;这个新的列表里的每个元素就是lambda表达式返回的结果。lambda里面巧妙的用 and 函数
+      ;;达到了这样的功能，如果一个item成功经过过滤，那么返回的结果就是这个item本身，否则
+      ;;就是nil。经过mapcar之后的列表就变成了item和nil组成的，最后经过delq函数把 nil的
+      ;;元素删掉。这个程序达到了不在脚本中做循环操作进行列表的遍历，速度比用循环快很多。
+      (setq cucc-current-items
+            (delq nil
+                  (mapcar (lambda (item)
+                            (and (funcall 'cucc-is-completion-item item) item))
+                          cucc-list))))
+    ))
+
+
+(defun cucc-fill-buffer ()
+  "把自动匹配结果填充 *cuc-completion* 缓冲区。"
+  (let ((items)(item_name))
+    (if cucc-list
+        (with-current-buffer (get-buffer-create cucc-buffer)
+          (erase-buffer)
+          (setq cucc-item-count 0)
+          (setq items (cucc-filter-items))
+          (setq cucc-item-line 1)
+          
+          (cucc-select-item)))
+    ))
+
+(defun cucc-fill-items-all (items)
+  "全部填充items，一般不需要这样填.可以在一些操作策略情况下调用这个函数"
+  (mapcar (lambda (item)
+            (insert
+             (cdr (assoc "category" item)) " "
+             ;;插入很多空格，这样使得光标占满整个窗口宽度
+             (cdr (assoc "name" item)) "                                                                       \n")) items))
+
+(defun cucc-fill-items-for-window-height(items)
+  "根据窗口的高度填充items的数目
+FIXME: 还没有实现总是填充窗口范围的算法，只能填充前面的项目，不过一般情况下这样也够用了，输入一个字母的过滤条件就能过滤掉很多项目"
+  (let ((item)(count 0)
+        (height (window-height (get-buffer-window "*cuc-completion*"))))
+    (while items
+      (setq item (car items))
+      ;;插入很多空格，这样使得光标占满整个窗口宽度
+      (insert
+       (cdr (assoc "category" item)) " "
+       (cdr (assoc "name" item)) "                                                                       \n")
+      (setq items (cdr items))
+      ;;控制只填充整个窗口高度的item，这样可以使得填充的数目只与窗口高度相关
+      (if (> count height) (setq items nil))
+      (setq count (+ count 1)))
+    ))
+
+(defun cucc-fill-buffer ()
+  "把自动匹配结果填充 *cuc-completion* 缓冲区。"
+  (let ((items)(item_name))
+    (if cucc-list
+        (with-current-buffer (get-buffer-create cucc-buffer)
+          (erase-buffer)
+          (setq items (cucc-filter-items))
+          (setq cucc-item-line 1)
+          (cucc-fill-items-for-window-height items)
+          ;;(cucc-fill-items-all items)
+          (cucc-select-item)))
+    ))
+
+
+(defun elisp-test()
+  (interactive)
+  (message "%s" (cucc-is-global-completion))
+  )
+
+(defun cucc-is-global-completion()
+  "判断光标当前位置是否需要全局匹配。"
+  (let ((token)(ret nil)(old-pos (point)))
+  (c-backward-token-1)
+  (setq token (buffer-substring-no-properties (point) (+ (point) 1)))
+  (cond
+   ((string= token ".") (setq ret t))
+   ((string= token ">")
+    (c-backward-token-1)
+    (setq token (buffer-substring-no-properties (point) (+ (point) 1)))    
+    (setq ret (string= token "-")))
+   ((string= token ":")
+    (c-backward-token-1)
+    (setq token (buffer-substring-no-properties (point) (+ (point) 1)))
+    (setq ret (string= token ":"))))
+  (goto-char old-pos)
+  (setq ret (not ret))
+  ))
+
+
+(defun cucc-process-filter(proc string)
+  (setq cucc-result-string (concat cucc-result-string string)))
+
+(defun cucc-process-sentinel(proc event string)
+  "cuc进程结束时被调用，使用 eval-buffer 把buffer中的文本当作lisp程序执行，建立数据结构，存储在 cuc-completion-list 里面。如果cuc进程执行成功，并且有匹配项，返回匹配的结构对象，否则返回null"
+  ;;cucc-process-sentinel segmentation fault: 11
+  (let ((ret t))
+    (if (and (string= string "") (not (string= event "killed: 9\n")))
+        ;;发生了错误，导致没有任何返回结果
+        (progn 
+          (message "%s args: %s" event (cuc-args))
+          (setq ret nil))  
+      (with-current-buffer (get-buffer-create "*cuc-output*" )
+        (erase-buffer)
+        (insert string)
+        (eval-buffer) ;;cuc-completion-list 在这里执行以后产生
+        (setq ret cuc-completion-list)
+        ))))
+
+(defun cucc-local-process-sentinel(proc event)
+  (setq cucc-list (cucc-process-sentinel proc event cucc-result-string))
+  (cucc-fill-buffer))
+
+
+(defvar cucc-result-string "")
+(defun cucc-code-completion-local()
+  "自动完成具有限定空间的符号，限定符号是 '.' '->' 和 '::' "
+  (save-buffer)
+  (setq cucc-result-string  "")
+  (setq cuc-proc (get-process "cuc-process"))
+  (if cuc-proc (delete-process cuc-proc))
+  (setq cuc-proc (apply 'cuc-start-process
+                        "cuc-process"
+                        cuc-executable-code-completion
+                        (cuc-args)))
+  (set-process-filter cuc-proc 'cucc-process-filter)
+  (set-process-sentinel cuc-proc 'cucc-local-process-sentinel))
+
+
+(defvar cucc-global-process-file nil)
+(defvar cucc-global-result-string nil)
+
+(defun cucc-global-process-filter(proc string)
+  (setq cucc-global-result-string (concat cucc-global-result-string string)))
+
+(defun cucc-global-process-sentinel(proc event)
+  (let ((file cucc-global-process-file)(items)(global-lisp))
+    (setq items (cucc-process-sentinel proc event cucc-global-result-string))
+    (message "global completion end. cuc-is-global-completion = %s"
+             cuc-is-global-completion)
+    
+    ;;加上cuc-is-global-completion判断，因为从cuc进程那边过来的不一定是全局匹配，
+    ;;加上这个从cuc进程过来的变量判断是最保险的。
+    (if (and items cuc-is-global-completion)
+        (progn
+          (setq global-list (assoc "global-list" file))
+          (setcdr global-list items)
+          (if (not cucc-list)
+              (progn
+                (setq cucc-list items)
+                (cucc-fill-buffer)))
+          ))
+    ))
+
+(defun cucc-code-completion-global-call()
+  "执行真正的cuc自动完成进程"
+  (let ((file (cuc-get-current-file-object))(old-size)(global-lisp)(proc))
+    (setq cuc-is-global-completion nil)
+    (setq old-size (assoc "old-size" file))
+    (setcdr old-size (buffer-size))
+    (save-buffer)
+    (setq cucc-global-result-string  "")    
+    (message "start global completion ...")
+    (setq cucc-global-proc (apply 'cuc-start-process
+                                  "cucc-global-process"
+                                  cuc-executable-code-completion
+                                  (cuc-args)))
+    (set-process-filter cucc-global-proc 'cucc-global-process-filter)
+    (set-process-sentinel cucc-global-proc 'cucc-global-process-sentinel)
+    ;;记下用于匹配的相关文件，防止在进程没有完成时用户换了文件，这个变量会在
+    ;;cucc-global-process-sentinel函数里使用
+    (setq cucc-global-process-file file)  ))
+  
+(defun cucc-code-completion-global()
+  "自动完成全局空间的符号,这个操作会列出光标所在处能使用的任何符号，没有限定空间.因为全局匹配的资源消耗很大，会影响正常操作，因此cucu对全局匹配进行特殊的优化。这个优化的策略是:用 cucc-global-list 变量记录下所有全局定义，当光标所在处是全局匹配时，使用这个变量来进行匹配,不会去临时获取定义列表。 cucc-global-list 的更新策略为:当用户的按键次数达到了一定数目时，才调用cuc库进行全局定义的更新，按键次数记录在 cucc-global-key-count ,触发进程调用的按键次数是 cucc-global-call-count 。
+这个算法的缺点是:有时不是很准确，在用户从一个名字空间跳到另一个名字空间时，可能 cucc-global-list 没有及时的更新，导致前面那个名字空间的定义会在这个名字空间中的全局匹配里出现。这个问题可以通过下面的算法来解决:在lisp程序里，在匹配之前总是判断当前的名字空间是否和原来的一样，如果不一样，就不必等到 cucc-global-call-count 按键次数，而直接触发进程调用更新 cucc-global-list 。这个算法看起来不错，可能可以更激进点:在lisp里为每个名字空间保存一个单独 global-list 。
+但实际上，我们一般不会一会儿在这个名字空间，一会儿在那个名字空间里编码，更多的时候，我们是在不同文件里面跳转，而且不同的文件导致全局定义的不同更大，因此为每个文件保持一个cucc-global-list才是最恰当的。所有文件信息的列表在 cuc-base.el里实现，变量为 cuc-source-files"
+  (let ((file (cuc-get-current-file-object))(old-size)(global-lisp)
+        (diff-buffer-size)
+        (proc (get-process "cucc-global-process")))
+    (setq old-size (assoc "old-size" file))
+    (setq global-list (assoc "global-list" file))
+    (setq diff-buffer-size (- (cdr old-size) (buffer-size)))
+    (if (or (not (cdr global-list))
+            (> (abs diff-buffer-size) cucc-global-call-count))
+        ;;如果已经有一个全局匹配进程，就不执行进程
+        (if (not proc) (cucc-code-completion-global-call)))
+    
+    ;;不必等cuc进程执行完毕，先用当前的全局表
+    (setq cucc-list (cdr global-list))    
+    (cucc-fill-buffer)
+  ))
+
+(defun cucc-code-completion ()
+  "代码自动匹配"
+  (interactive)  
+  (setq cucc-substring "")
+  (with-current-buffer (get-buffer-create "*cuc-completion*")
+    (erase-buffer))
+  (if (cucc-is-global-completion)
+      (cucc-code-completion-global)
+    (cucc-code-completion-local)))
+
+(defun cucc-code-manual-completion()
+  "手工进行自动匹配"
+  (interactive)
+  (setq cucc-list nil)
+  (cucc-fill-buffer)
+  (cucc-code-completion))
+  
+
+;; Determine whether FIXME: explain better
+(defun cucc-is-completion-item (item)
+  (string-match  (concat "^" cucc-substring)
+                 (cdr (assoc "name" item))))
+    
+
+
+
+;;==============================================================================
+
+;;这个模式是给 *cuc-completion* buffer用的
+(defun cucc-items-mode()
+  (let ((old-buffer (current-buffer))
+        (buffer (get-buffer-create cucc-buffer)))
+    (switch-to-buffer buffer)    
+    (set-buffer buffer)
+    (set-window-dedicated-p (get-buffer-window)  t)
+    (setq major-mode 'cucc-items-mode)
+    (setq mode-name "complete-items")
+    (cucc-init-mode)
+    (setq truncate-lines t)
+    (setq buffer buffer)
+  ))
+
+
+(defface cucc-item-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#99ff55" :weight bold))
+"" :group 'cucc-items-mode)
+(defface cucc-property-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#ff66ee" :weight bold))
+"" :group 'cucc-items-mode)
+(defface cucc-field-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#2fcebf" :weight bold))
+"" :group 'cucc-items-mode)
+(defface cucc-event-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#ff8844" :weight bold))
+"" :group 'cucc-items-mode)
+(defface cucc-operator-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "DeepSkyBlue1" ))
+"" :group 'cucc-items-mode)
+(defface cucc-type-header-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#000000" ))
+"" :group 'cucc-items-mode)
+
+(defface cucc-const-value-face
+'((((class color) (min-colors 88) (background dark))
+   :foreground "#9f9f9f" ))
+"" :group 'cucc-items-mode)
+
+(defun cucc-init-mode ()
+  (font-lock-mode)
+  (font-lock-add-keywords 
+   nil
+   (list
+    '("^\\([A-Z]\\) " 1 'cucc-type-header-face)
+    '("^V \\(.+\\)" 1 'cucc-field-face)
+    '("^E \\(.+\\)" 1 'cucc-event-face)
+    '("^P \\(.+\\)" 1 'cucc-property-face)
+    '("^O \\(.+\\)" 1 'cucc-operator-face)
+    '("^C \\(.+\\)" 1 'cucc-const-value-face)
+    '("^[A-Z] \\(.+\\)" 1 'cucc-item-face)
+         ))
+  (setq truncate-lines t))
+
+
+;; re-process the completions when further input narrows the field
+(defun cucc-display (buffer)
+  (if (not (get-buffer cucc-buffer)) (cucc-items-mode))
+  (cucc-fill-buffer))
+
+;; Invoked when the user types the backspace key to update the filter
+;; for the currently-active code completion.
+(defun cucc-backspace ()
+  (interactive)
+  (c-hungry-backspace)
+  (cucc-update-filter))
+
+;; Invoked when the user types the delete key to update the filter
+;; for the currently-active code completion.
+(defun cucc-delete ()
+  (interactive)
+  (c-hungry-delete)
+  (cucc-update-filter))
+
+;; When the user has typed a character that requires the filter to be
+;; updated, do so (and update the display of results).
+(defun cucc-update-filter ()
+  (setq cucc-substring (thing-at-point 'symbol))
+  (if (get-process "cuc-process")
+      ()
+    (cucc-display cucc-buffer)
+    ))
+
+;; Code-completion when one of the trigger characters is typed into
+;; the buffer, e.g., '(', ',' or '.'.
+(defun cucc-self-insert (arg)
+  (interactive "p")
+  (let ((ch1)(ch2))
+  (self-insert-command arg)
+  (setq ch1 (buffer-substring-no-properties (- (point) 1) (point)))
+  (setq ch2 (buffer-substring-no-properties (- (point) 2) (- (point) 1)))
+  ;;如果当前输入 ":" 符号，那么必须前一个也是 ":" 符号，才进行代码完成操作。
+  (if (and (string= ch1 ":") (string= ch2 ":"))
+      (cucc-code-completion)
+    (if (not (string= ch1 ":"))
+        (cucc-code-completion)))
+  ))
+
+;; Invoked when the user types an alphanumeric character or "_" to
+;; update the filter for the currently-active code completion.
+(defun cucc-filter-self-insert (arg)
+  (interactive "p")
+  (self-insert-command arg)
+  (cucc-update-filter)
+  )
+
+;; Set up the keymap for the CUC minor mode.
+(defvar cucc-mode-map nil
+  "Keymap for CUC Completion Mode.")
+
+(if (null cucc-mode-map)
+    (fset 'cucc-mode-map 
+          (setq cucc-mode-map (make-sparse-keymap))))
+
+(if (not (assq 'cucc-mode minor-mode-map-alist))
+    (setq minor-mode-map-alist
+          (cons (cons 'cucc-mode cucc-mode-map)
+                minor-mode-map-alist)))
+
+
+
+;; Punctuation characters trigger code completion.
+(dolist (char '("(" "," "." ">" ":" "=" ")" " "))
+  (define-key cucc-mode-map char 'cucc-self-insert))
+
+;; Alphanumeric characters (and "_") filter the results of the
+;; currently-active code completion.
+(dolist (char '("A" "B" "C" "D" "E" "F" "G" "H" "I" "J" "K" "L" "M" "N" "O"
+                "P" "Q" "R" "S" "T" "U" "V" "W" "X" "Y" "Z"
+                "a" "b" "c" "d" "e" "f" "g" "h" "i" "j" "k" "l" "m" "n" "o"
+                "p" "q" "r" "s" "t" "u" "v" "w" "x" "y" "z"
+                "_" "0" "1" "2" "3" "4" "5" "6" "7" "8" "9"))
+  (define-key cucc-mode-map char 'cucc-filter-self-insert))
+
+(defun cucc-overload-next()
+  (interactive)
+  (let ((overloads)(count))
+    (setq overloads (cdr (assoc "overloads" (cucc-current-item))))
+    (if overloads
+        (progn 
+          (setq count (list-length overloads))    
+          (with-current-buffer (get-buffer-create "*cuc-message*")
+            (if (eq cucc-overload-line count)
+                (setq cucc-overload-line 1)
+              (setq cucc-overload-line (+ cucc-overload-line 1)))
+            (cucc-select-oveload)))
+      )))
+
+(defun cucc-overload-prev()
+  (interactive)
+  (let ((overloads)(count))
+    (setq overloads (cdr (assoc "overloads" (cucc-current-item))))
+    (if overloads
+        (progn 
+          (setq count (list-length overloads))    
+          (with-current-buffer (get-buffer-create "*cuc-message*")
+            (if (eq cucc-overload-line 1)
+                (setq cucc-overload-line count)
+              (setq cucc-overload-line (- cucc-overload-line 1)))
+            (cucc-select-oveload)))
+      )))
+
+(defun cucc-item-next()
+  (interactive)
+  (let ((count))
+    (with-current-buffer (get-buffer-create "*cuc-completion*")
+      (setq count (list-length cucc-current-items))
+      (if (eq cucc-item-line count)
+          (setq cucc-item-line 1)
+        (setq cucc-item-line (+ cucc-item-line 1)))
+      (cucc-select-item)
+      )))
+
+(defun cucc-item-prev()
+  (interactive)
+  (let ((count))
+    (with-current-buffer (get-buffer-create "*cuc-completion*")
+      (setq count (list-length cucc-current-items))      
+      (if (eq cucc-item-line 1)
+          (setq cucc-item-line count)
+        (setq cucc-item-line (- cucc-item-line 1)))
+      (cucc-select-item)
+      )))
+
+(defun elisp-test()
+  (interactive)
+  
+  )
+
+(defun cucc-jump-to-cuc-message()
+  (interactive)
+  (select-window (get-buffer-window "*cuc-message*")) )
+
+(defun cucc-jump-to-cuc-completion()
+  (interactive)
+  (let ((height (window-height (get-buffer-window "*cuc-completion*"))))
+    (select-window (get-buffer-window "*cuc-completion*"))
+
+    ;;如果原来没有把所有的筛选后的items都填入 *cuc-completion* 就需要进行填充
+    (if (<= (line-number-at-pos (point-max))
+            (list-length cucc-current-items))
+        (progn
+          (cucc-fill-items-all cucc-current-items)
+          (cucc-select-item)))
+    ))
+
+(defun cucc-insert-item()
+  (interactive)
+  (let ((item (cucc-current-item))(old-pos (point))
+        (char)(category)(overloads)(overload))
+    (if item
+        (progn      
+          (search-backward-regexp "[^a-zA-Z0-9_]")
+          (goto-char (+ (point) 1))
+          (delete-region (point) old-pos)
+          (insert (cdr (assoc "name" item)))
+          (setq category (cdr (assoc "category" item)))
+          (cond
+           ((string= category "M") (insert "()")
+            (setq overloads (cdr (assoc "overloads" item)))
+            (setq overload (car overloads))
+            (if (or (> (list-length overloads) 1)
+                     (> (cdr (assoc "num_args" overload)) 0))
+                (goto-char (- (point) 1)))
+            (cucc-code-completion)
+            ))))
+  ))
+
+;; Delete and backspace filter the results of the currently-active
+;; code completion.
+(define-key cucc-mode-map [(backspace)] 'cucc-backspace)
+(define-key cucc-mode-map [(delete)] 'cucc-delete)
+(define-key cucc-mode-map [(meta n)] 'cucc-overload-next)
+(define-key cucc-mode-map [(meta p)] 'cucc-overload-prev)
+(define-key cucc-mode-map "\M-]" 'cucc-item-next)
+(define-key cucc-mode-map "\M-[" 'cucc-item-prev)
+(define-key cucc-mode-map [(control \\)] 'cucc-insert-item)
+
+
+;; Set up the cuc minor mode.
+;;这个模式是给源代码buffer用的
+(define-minor-mode cucc-mode 
+  "cuc-code-completion mode"
+  nil
+  " CUC"
+  cucc-mode-map)
